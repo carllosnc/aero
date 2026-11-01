@@ -1,0 +1,40 @@
+[package]
+name = "drop"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Windowing & OS
+winit = { version = "0.30", features = ["rwh_06"] }
+raw-window-handle = "0.6"
+
+# Windows API & DWM
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
+] }
+
+# GPU & Text Rendering
+wgpu = "23.0"
+glyphon = "0.7"
+bytemuck = { version = "1.25", features = ["derive"] }
+
+# Terminal Emulation & PTY
+alacritty_terminal = "0.24"
+portable-pty = "0.8"
+
+# Utilities & Error Handling
+anyhow = "1.0"
+arboard = "3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+pollster = "1.0.1"
+egui = "0.30"
+egui-wgpu = "0.30"
+egui-winit = "0.30"
