@@ -24,6 +24,7 @@ use crate::renderer::{
 };
 use crate::settings_ui::{SettingsUi, SettingsWindowState};
 use crate::terminal::Terminal;
+use alacritty_terminal::selection::SelectionType;
 
 const BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -101,10 +102,15 @@ pub struct DropApp {
     drop_height: u32,
     last_animated_y: i32,
 
-    // Mouse position & dragging state for border resize detection
+    // Mouse position & dragging state for border resize detection and selection
     cursor_pos: PhysicalPosition<f64>,
     is_dragging_border: bool,
+    is_selecting: bool,
+    last_click_time: Instant,
+    last_click_pos: PhysicalPosition<f64>,
+    click_count: u8,
     scroll_pixel_accumulator: f32,
+    toast: Option<(String, Instant)>,
 
     // Slide animation state
     anim_state: AnimationState,
@@ -150,7 +156,12 @@ impl DropApp {
             last_animated_y: -480,
             cursor_pos: PhysicalPosition::new(0.0, 0.0),
             is_dragging_border: false,
+            is_selecting: false,
+            last_click_time: Instant::now(),
+            last_click_pos: PhysicalPosition::new(0.0, 0.0),
+            click_count: 0,
             scroll_pixel_accumulator: 0.0,
+            toast: None,
 
             anim_state: AnimationState::Closed,
             anim_progress: 0.0,
@@ -224,8 +235,18 @@ impl DropApp {
             ));
         }
 
+        let palette = self.palette();
+        let fg_u8 = palette.fg_color;
+        let bg_u8 = [
+            (palette.bg[0] * 255.0).round() as u8,
+            (palette.bg[1] * 255.0).round() as u8,
+            (palette.bg[2] * 255.0).round() as u8,
+        ];
+
         for tab in &mut self.tabs {
-            tab.terminal.lock().unwrap().resize(cols, rows);
+            let mut term = tab.terminal.lock().unwrap();
+            term.resize(cols, rows);
+            term.set_theme_colors(fg_u8, bg_u8);
             let _ = tab.pty.resize(cols, rows);
         }
 
@@ -261,15 +282,15 @@ impl DropApp {
     }
 
     pub fn create_settings_window(&mut self, event_loop: &ActiveEventLoop) {
-        let size = PhysicalSize::new(680, 520);
+        let size = PhysicalSize::new(760, 580);
         let (pos_x, pos_y) = if let Some(monitor) = event_loop
             .primary_monitor()
             .or_else(|| event_loop.available_monitors().next())
         {
             let mon_size = monitor.size();
             let mon_pos = monitor.position();
-            let x = mon_pos.x + (mon_size.width as i32 - 680) / 2;
-            let y = mon_pos.y + (mon_size.height as i32 - 520) / 2;
+            let x = mon_pos.x + (mon_size.width as i32 - 760) / 2;
+            let y = mon_pos.y + (mon_size.height as i32 - 580) / 2;
             (x, y)
         } else {
             (self.monitor_pos_x + 100, self.monitor_pos_y + 100)
@@ -316,16 +337,24 @@ impl DropApp {
         let tab_id = self.next_tab_id;
         self.next_tab_id += 1;
 
-        let terminal = Arc::new(Mutex::new(Terminal::new(cols, rows)));
+        let palette = self.palette();
+        let fg_u8 = palette.fg_color;
+        let bg_u8 = [
+            (palette.bg[0] * 255.0).round() as u8,
+            (palette.bg[1] * 255.0).round() as u8,
+            (palette.bg[2] * 255.0).round() as u8,
+        ];
+        let terminal = Arc::new(Mutex::new(Terminal::with_colors(cols, rows, fg_u8, bg_u8)));
         let proxy = self.proxy.clone();
-        match PtyManager::new(tab_id, cols, rows, proxy, |id, bytes| AppEvent::PtyOutput {
+        let shell = self.config.shell.clone();
+        match PtyManager::new(tab_id, cols, rows, &shell, proxy, |id, bytes| AppEvent::PtyOutput {
             tab_id: id,
             bytes,
         }) {
             Ok(pty) => {
                 let tab = Tab {
                     id: tab_id,
-                    title: title.unwrap_or_else(|| "pwsh".to_string()),
+                    title: title.unwrap_or_else(|| shell),
                     terminal,
                     pty,
                 };
@@ -392,6 +421,7 @@ impl DropApp {
     }
 
     pub fn handle_tab_bar_click(&mut self, click_x: f64, event_loop: Option<&ActiveEventLoop>) {
+        self.is_selecting = false;
         let width = self
             .window
             .as_ref()
@@ -428,6 +458,62 @@ impl DropApp {
                 }
                 return;
             }
+        }
+    }
+
+    pub fn copy_selection(&mut self) -> bool {
+        let text_opt = if let Some(tab) = self.tabs.get(self.active_tab_index) {
+            let term = tab.terminal.lock().unwrap();
+            term.selection_text()
+        } else {
+            None
+        };
+
+        if let Some(text) = text_opt {
+            if !text.is_empty() {
+                match arboard::Clipboard::new() {
+                    Ok(mut clipboard) => {
+                        if let Err(e) = clipboard.set_text(text) {
+                            tracing::error!("Failed to set clipboard text: {:?}", e);
+                            return false;
+                        }
+                        tracing::info!("Copied selection to clipboard");
+                        self.toast = Some(("Copiado!".to_string(), Instant::now()));
+                        self.update_tab_bar_buffer();
+                        return true;
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to open clipboard: {:?}", e);
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    pub fn open_url(url: &str) {
+        let clean = url.trim().to_string();
+        if clean.starts_with("http://") || clean.starts_with("https://") {
+            tracing::info!("Opening browser hyperlink: {}", clean);
+            let _ = std::process::Command::new("rundll32")
+                .args(["url.dll,FileProtocolHandler", &clean])
+                .spawn();
+        }
+    }
+
+    pub fn has_selection(&self) -> bool {
+        if let Some(tab) = self.tabs.get(self.active_tab_index) {
+            tab.terminal.lock().unwrap().has_selection()
+        } else {
+            false
+        }
+    }
+
+    pub fn clear_selection(&mut self) -> bool {
+        if let Some(tab) = self.tabs.get(self.active_tab_index) {
+            tab.terminal.lock().unwrap().clear_selection()
+        } else {
+            false
         }
     }
 
@@ -473,13 +559,20 @@ impl DropApp {
             spans.push(("   ".to_string(), text_attrs));
         }
 
+        if let Some((msg, timestamp)) = &self.toast {
+            if timestamp.elapsed() < Duration::from_millis(1500) {
+                let toast_attrs = base_attrs.color(glyphon::Color::rgb(56, 189, 248));
+                spans.push((format!("   📋 {}  ", msg), toast_attrs));
+            }
+        }
+
         let span_refs: Vec<(&str, glyphon::Attrs)> = spans.iter().map(|(s, a)| (s.as_str(), *a)).collect();
 
         tab_buffer.set_rich_text(
             &mut renderer.font_system,
             span_refs,
             inactive_attrs,
-            glyphon::Shaping::Basic,
+            glyphon::Shaping::Advanced,
         );
         tab_buffer.shape_until_scroll(&mut renderer.font_system, false);
     }
@@ -536,8 +629,18 @@ impl DropApp {
             }
         }
 
+        let palette = self.palette();
+        let fg_u8 = palette.fg_color;
+        let bg_u8 = [
+            (palette.bg[0] * 255.0).round() as u8,
+            (palette.bg[1] * 255.0).round() as u8,
+            (palette.bg[2] * 255.0).round() as u8,
+        ];
+
         for tab in &mut self.tabs {
-            tab.terminal.lock().unwrap().resize(cols, rows);
+            let mut term = tab.terminal.lock().unwrap();
+            term.resize(cols, rows);
+            term.set_theme_colors(fg_u8, bg_u8);
             let _ = tab.pty.resize(cols, rows);
         }
 
@@ -699,21 +802,29 @@ impl ApplicationHandler<AppEvent> for DropApp {
                     }
                 }
 
-                // Initialize Initial Tab (PowerShell 7)
+                // Initialize Initial Tab with configured shell
                 let (cols, rows) = self.grid_cols_rows();
                 let tab_id = 1;
                 self.next_tab_id = 2;
-                let terminal = Arc::new(Mutex::new(Terminal::new(cols, rows)));
+                let palette = self.palette();
+                let fg_u8 = palette.fg_color;
+                let bg_u8 = [
+                    (palette.bg[0] * 255.0).round() as u8,
+                    (palette.bg[1] * 255.0).round() as u8,
+                    (palette.bg[2] * 255.0).round() as u8,
+                ];
+                let terminal = Arc::new(Mutex::new(Terminal::with_colors(cols, rows, fg_u8, bg_u8)));
                 let proxy_clone = self.proxy.clone();
-                match PtyManager::new(tab_id, cols, rows, proxy_clone, |id, bytes| AppEvent::PtyOutput {
+                let shell = self.config.shell.clone();
+                match PtyManager::new(tab_id, cols, rows, &shell, proxy_clone, |id, bytes| AppEvent::PtyOutput {
                     tab_id: id,
                     bytes,
                 }) {
                     Ok(pty) => {
-                        tracing::info!("PTY session spawned successfully for Tab 1 with PowerShell 7");
+                        tracing::info!("PTY session spawned successfully for Tab 1 with shell {}", shell);
                         self.tabs.push(Tab {
                             id: tab_id,
-                            title: "pwsh".to_string(),
+                            title: shell,
                             terminal,
                             pty,
                         });
@@ -757,6 +868,17 @@ impl ApplicationHandler<AppEvent> for DropApp {
                                     palette.fg_color[1],
                                     palette.fg_color[2],
                                 ),
+                                glyphon::Color::rgb(
+                                    (palette.bg[0] * 255.0).round() as u8,
+                                    (palette.bg[1] * 255.0).round() as u8,
+                                    (palette.bg[2] * 255.0).round() as u8,
+                                ),
+                                [
+                                    palette.accent[0],
+                                    palette.accent[1],
+                                    palette.accent[2],
+                                    0.38,
+                                ],
                             );
                         let cursor_info = if row < usize::MAX {
                             let cx = self.config.padding_x + (col as f32) * cell_w;
@@ -822,14 +944,38 @@ impl ApplicationHandler<AppEvent> for DropApp {
             }
             AppEvent::PtyOutput { tab_id, bytes } => {
                 let mut should_redraw = false;
-                if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
-                    tab.terminal.lock().unwrap().process_bytes(&bytes);
+                let mut title_change = false;
+
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                    let pty_writes = {
+                        let mut term = tab.terminal.lock().unwrap();
+                        term.process_bytes(&bytes);
+                        let writes = term.take_pty_writes();
+                        if let Some(new_title) = term.take_tab_title() {
+                            if !new_title.is_empty() && tab.title != new_title {
+                                tab.title = new_title;
+                                title_change = true;
+                            }
+                        }
+                        writes
+                    };
+
+                    if !pty_writes.is_empty() {
+                        let _ = tab.pty.write(&pty_writes);
+                    }
+
                     if let Some(active_tab) = self.tabs.get(self.active_tab_index) {
                         if active_tab.id == tab_id {
                             should_redraw = true;
                         }
                     }
                 }
+
+                if title_change {
+                    self.update_tab_bar_buffer();
+                    should_redraw = true;
+                }
+
                 if should_redraw {
                     if let Some(window) = &self.window {
                         window.request_redraw();
@@ -1114,6 +1260,41 @@ impl ApplicationHandler<AppEvent> for DropApp {
                     if let Some(window) = &self.window {
                         window.set_cursor(CursorIcon::NsResize);
                     }
+                } else if self.is_selecting {
+                    if let Some(tab) = self.tabs.get(self.active_tab_index) {
+                        let (cell_w, cell_h) = self.cell_metrics;
+                        let mut term = tab.terminal.lock().unwrap();
+
+                        // Auto-scroll when dragging past vertical margins
+                        if position.y < self.config.padding_y as f64 {
+                            let factor = ((self.config.padding_y as f64 - position.y) / cell_h as f64)
+                                .ceil()
+                                .clamp(1.0, 5.0) as i32;
+                            term.scroll(factor);
+                        } else if position.y > tab_bar_top {
+                            let factor = ((position.y - tab_bar_top) / cell_h as f64)
+                                .ceil()
+                                .clamp(1.0, 5.0) as i32;
+                            term.scroll(-factor);
+                        }
+
+                        if let Some((point, side)) = term.point_at_pos(
+                            position.x,
+                            position.y,
+                            self.config.padding_x,
+                            self.config.padding_y,
+                            cell_w,
+                            cell_h,
+                        ) {
+                            term.update_selection(point, side);
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                        }
+                    }
+                    if let Some(window) = &self.window {
+                        window.set_cursor(CursorIcon::Text);
+                    }
                 } else if self.anim_state == AnimationState::Open {
                     let is_on_bottom_border = position.y >= (height - RESIZE_BORDER_THICKNESS);
                     let is_on_plus_btn = position.y >= tab_bar_top
@@ -1122,6 +1303,27 @@ impl ApplicationHandler<AppEvent> for DropApp {
                     let is_on_set_btn = position.y >= tab_bar_top
                         && position.x >= set_x
                         && position.x <= (set_x + btn_w);
+
+                    // Check if hovering over a URL while holding Ctrl
+                    let is_hovering_url = if self.modifiers.control_key() && position.y < tab_bar_top {
+                        if let Some(tab) = self.tabs.get(self.active_tab_index) {
+                            let (cell_w, cell_h) = self.cell_metrics;
+                            let term = tab.terminal.lock().unwrap();
+                            term.url_at_pos(
+                                position.x,
+                                position.y,
+                                self.config.padding_x,
+                                self.config.padding_y,
+                                cell_w,
+                                cell_h,
+                            )
+                            .is_some()
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
 
                     if let Some(window) = &self.window {
                         if is_on_bottom_border {
@@ -1132,8 +1334,10 @@ impl ApplicationHandler<AppEvent> for DropApp {
                         } else if position.y >= tab_bar_top {
                             window.set_cursor(CursorIcon::Pointer);
                             window.request_redraw();
+                        } else if is_hovering_url {
+                            window.set_cursor(CursorIcon::Pointer);
                         } else {
-                            window.set_cursor(CursorIcon::Default);
+                            window.set_cursor(CursorIcon::Text);
                         }
                     }
                 }
@@ -1143,12 +1347,22 @@ impl ApplicationHandler<AppEvent> for DropApp {
                 button,
                 ..
             } => {
-                if state == ElementState::Pressed {
-                    if button == MouseButton::Right {
+                if button == MouseButton::Right && state == ElementState::Pressed {
+                    if self.has_selection() {
+                        self.copy_selection();
+                        self.clear_selection();
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    } else {
                         self.paste_clipboard();
-                        return;
                     }
-                    if button == MouseButton::Left {
+                    return;
+                }
+
+                if button == MouseButton::Left {
+                    if state == ElementState::Pressed {
+                        let x = self.cursor_pos.x;
                         let y = self.cursor_pos.y;
                         let height = self.drop_height as f64;
                         let is_on_bottom_border = y >= (height - RESIZE_BORDER_THICKNESS);
@@ -1157,10 +1371,85 @@ impl ApplicationHandler<AppEvent> for DropApp {
                             self.is_dragging_border = true;
                         } else if y >= (height - TAB_BAR_HEIGHT as f64) {
                             self.handle_tab_bar_click(self.cursor_pos.x, Some(event_loop));
+                        } else {
+                            // Check for Ctrl + Click on web hyperlinks
+                            if self.modifiers.control_key() {
+                                let url_opt = if let Some(tab) = self.tabs.get(self.active_tab_index) {
+                                    let (cell_w, cell_h) = self.cell_metrics;
+                                    let term = tab.terminal.lock().unwrap();
+                                    term.url_at_pos(
+                                        x,
+                                        y,
+                                        self.config.padding_x,
+                                        self.config.padding_y,
+                                        cell_w,
+                                        cell_h,
+                                    )
+                                } else {
+                                    None
+                                };
+
+                                if let Some(url) = url_opt {
+                                    Self::open_url(&url);
+                                    return;
+                                }
+                            }
+
+                            let now = Instant::now();
+                            let dist_sq = (x - self.last_click_pos.x).powi(2) + (y - self.last_click_pos.y).powi(2);
+                            if now.duration_since(self.last_click_time) < Duration::from_millis(400) && dist_sq < 36.0 {
+                                self.click_count = (self.click_count % 3) + 1;
+                            } else {
+                                self.click_count = 1;
+                            }
+                            self.last_click_time = now;
+                            self.last_click_pos = self.cursor_pos;
+
+                            let sel_type = match self.click_count {
+                                2 => SelectionType::Semantic,
+                                3 => SelectionType::Lines,
+                                _ => SelectionType::Simple,
+                            };
+
+                            if let Some(tab) = self.tabs.get(self.active_tab_index) {
+                                let (cell_w, cell_h) = self.cell_metrics;
+                                let mut term = tab.terminal.lock().unwrap();
+                                if let Some((point, side)) = term.point_at_pos(
+                                    x,
+                                    y,
+                                    self.config.padding_x,
+                                    self.config.padding_y,
+                                    cell_w,
+                                    cell_h,
+                                ) {
+                                    term.start_selection(sel_type, point, side);
+                                    self.is_selecting = true;
+                                    if let Some(window) = &self.window {
+                                        window.request_redraw();
+                                    }
+                                } else if term.clear_selection() {
+                                    if let Some(window) = &self.window {
+                                        window.request_redraw();
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Released
+                        self.is_dragging_border = false;
+                        if self.is_selecting {
+                            self.is_selecting = false;
+                            if let Some(tab) = self.tabs.get(self.active_tab_index) {
+                                let mut term = tab.terminal.lock().unwrap();
+                                if self.click_count == 1 && !term.has_selection() {
+                                    term.clear_selection();
+                                }
+                            }
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
                         }
                     }
-                } else if button == MouseButton::Left {
-                    self.is_dragging_border = false;
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1194,6 +1483,21 @@ impl ApplicationHandler<AppEvent> for DropApp {
                                 window.request_redraw();
                             }
                         }
+                    }
+                }
+            }
+            WindowEvent::DroppedFile(path_buf) => {
+                if let Some(tab) = self.tabs.get(self.active_tab_index) {
+                    let path_str = path_buf.to_string_lossy();
+                    let formatted = if path_str.contains(' ') && !path_str.starts_with('"') {
+                        format!("\"{}\" ", path_str)
+                    } else {
+                        format!("{} ", path_str)
+                    };
+                    if let Err(e) = tab.pty.write(formatted.as_bytes()) {
+                        tracing::error!("Failed to write dropped file path to PTY: {:?}", e);
+                    } else if let Some(window) = &self.window {
+                        window.request_redraw();
                     }
                 }
             }
@@ -1255,6 +1559,17 @@ impl ApplicationHandler<AppEvent> for DropApp {
                                     palette.fg_color[1],
                                     palette.fg_color[2],
                                 ),
+                                glyphon::Color::rgb(
+                                    (palette.bg[0] * 255.0).round() as u8,
+                                    (palette.bg[1] * 255.0).round() as u8,
+                                    (palette.bg[2] * 255.0).round() as u8,
+                                ),
+                                [
+                                    palette.accent[0],
+                                    palette.accent[1],
+                                    palette.accent[2],
+                                    0.38,
+                                ],
                             );
 
                         let cursor_info = if self.cursor_visible && self.is_focused && row < usize::MAX {
@@ -1313,6 +1628,16 @@ impl ApplicationHandler<AppEvent> for DropApp {
                         ) {
                             tracing::error!("GPU frame render error: {:?}", e);
                         }
+
+                        if let Some((_, timestamp)) = &self.toast {
+                            if timestamp.elapsed() >= Duration::from_millis(1500) {
+                                self.toast = None;
+                                self.update_tab_bar_buffer();
+                                if let Some(window) = &self.window {
+                                    window.request_redraw();
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1335,6 +1660,43 @@ impl ApplicationHandler<AppEvent> for DropApp {
                 if *logical_key == Key::Named(NamedKey::Escape) && self.modifiers.shift_key() {
                     tracing::info!("Shift+Escape pressed, exiting DROP");
                     event_loop.exit();
+                    return;
+                }
+
+                // Copy shortcuts: Ctrl+Shift+C (always) or Ctrl+C (when selection is active)
+                let is_ctrl_c = self.modifiers.control_key()
+                    && !self.modifiers.alt_key()
+                    && match logical_key {
+                        Key::Character(s) => s.eq_ignore_ascii_case("c"),
+                        _ => false,
+                    };
+
+                if is_ctrl_c {
+                    if self.modifiers.shift_key() {
+                        if state.is_pressed() {
+                            self.copy_selection();
+                        }
+                        return;
+                    } else if self.has_selection() {
+                        if state.is_pressed() {
+                            self.copy_selection();
+                            self.clear_selection();
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                        }
+                        return;
+                    }
+                }
+
+                // Escape clears active selection if present
+                if *logical_key == Key::Named(NamedKey::Escape) && !self.modifiers.shift_key() && self.has_selection() {
+                    if state.is_pressed() {
+                        self.clear_selection();
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
                     return;
                 }
 
@@ -1519,7 +1881,9 @@ impl ApplicationHandler<AppEvent> for DropApp {
                     handle_key_input(logical_key, text.as_deref(), state, self.modifiers)
                 {
                     if let Some(tab) = self.tabs.get(self.active_tab_index) {
-                        tab.terminal.lock().unwrap().scroll_to_bottom();
+                        let mut term = tab.terminal.lock().unwrap();
+                        term.clear_selection();
+                        term.scroll_to_bottom();
                         if let Err(e) = tab.pty.write(&input_bytes) {
                             tracing::error!("Failed to write to active PTY: {:?}", e);
                         } else {
