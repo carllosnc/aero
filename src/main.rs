@@ -2,9 +2,11 @@ mod app;
 mod config;
 mod dwm;
 mod hotkey;
+mod icons;
 mod input;
 mod pty;
 mod renderer;
+mod settings_components;
 mod settings_ui;
 mod terminal;
 
