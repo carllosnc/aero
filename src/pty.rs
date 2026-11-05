@@ -15,6 +15,7 @@ impl PtyManager {
         tab_id: usize,
         cols: u16,
         rows: u16,
+        shell: &str,
         proxy: EventLoopProxy<T>,
         on_output: impl Fn(usize, Vec<u8>) -> T + Send + 'static,
     ) -> Result<Self> {
@@ -26,18 +27,36 @@ impl PtyManager {
             pixel_height: 0,
         })?;
 
-        // Prioritize PowerShell 7 (pwsh.exe)
-        let pwsh_full_path = r"C:\Program Files\PowerShell\7\pwsh.exe";
-        let exe = if std::path::Path::new(pwsh_full_path).exists() {
-            pwsh_full_path
-        } else {
-            "pwsh.exe"
+        let shell_lower = shell.trim().to_lowercase();
+        let (exe, fallback_exe) = match shell_lower.as_str() {
+            "cmd" | "cmd.exe" => ("cmd.exe".to_string(), None),
+            "powershell" | "powershell.exe" => ("powershell.exe".to_string(), None),
+            "wsl" | "wsl.exe" => ("wsl.exe".to_string(), Some("powershell.exe".to_string())),
+            "bash" | "git-bash" => {
+                let git_bash = r"C:\Program Files\Git\bin\bash.exe";
+                if std::path::Path::new(git_bash).exists() {
+                    (git_bash.to_string(), Some("powershell.exe".to_string()))
+                } else {
+                    ("bash.exe".to_string(), Some("powershell.exe".to_string()))
+                }
+            }
+            "pwsh" | "pwsh.exe" | "" => {
+                let pwsh_full_path = r"C:\Program Files\PowerShell\7\pwsh.exe";
+                if std::path::Path::new(pwsh_full_path).exists() {
+                    (pwsh_full_path.to_string(), Some("powershell.exe".to_string()))
+                } else {
+                    ("pwsh.exe".to_string(), Some("powershell.exe".to_string()))
+                }
+            }
+            custom => (custom.to_string(), Some("powershell.exe".to_string())),
         };
 
-        let mut cmd = CommandBuilder::new(exe);
+        let mut cmd = CommandBuilder::new(&exe);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        cmd.env("WT_SESSION", "1");
+        cmd.env("COLORFGBG", "15;0");
+        cmd.env("TERM_PROGRAM", "Aero");
+        cmd.env("WT_SESSION", "e0a0a520-2ef6-4df6-8800-000000000001");
 
         let child = match pair.slave.spawn_command(cmd) {
             Ok(c) => {
@@ -45,16 +64,23 @@ impl PtyManager {
                 c
             }
             Err(e) => {
-                tracing::warn!(
-                    "Failed to spawn pwsh ({}): {:?}. Falling back to powershell.exe",
-                    exe,
-                    e
-                );
-                let mut fallback = CommandBuilder::new("powershell.exe");
-                fallback.env("TERM", "xterm-256color");
-                fallback.env("COLORTERM", "truecolor");
-                fallback.env("WT_SESSION", "1");
-                pair.slave.spawn_command(fallback)?
+                if let Some(ref fb) = fallback_exe {
+                    tracing::warn!(
+                        "Failed to spawn primary shell ({}): {:?}. Falling back to {}",
+                        exe,
+                        e,
+                        fb
+                    );
+                    let mut fallback = CommandBuilder::new(fb);
+                    fallback.env("TERM", "xterm-256color");
+                    fallback.env("COLORTERM", "truecolor");
+                    fallback.env("COLORFGBG", "15;0");
+                    fallback.env("TERM_PROGRAM", "Aero");
+                    fallback.env("WT_SESSION", "e0a0a520-2ef6-4df6-8800-000000000001");
+                    pair.slave.spawn_command(fallback)?
+                } else {
+                    return Err(e.into());
+                }
             }
         };
 
