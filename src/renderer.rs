@@ -305,12 +305,12 @@ impl GpuRenderer {
             cache: None,
         });
 
-        let rect_vertex_capacity = 2048;
-        let initial_vertices = vec![RectVertex::new(0.0, 0.0, [0.0; 4]); rect_vertex_capacity];
-        let rect_vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let rect_vertex_capacity = 8192;
+        let rect_vertex_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("DROP Rect Vertex Buffer"),
-            contents: bytemuck::cast_slice(&initial_vertices),
+            size: (rect_vertex_capacity * std::mem::size_of::<RectVertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         Ok(Self {
@@ -358,7 +358,7 @@ impl GpuRenderer {
             &mut self.font_system,
             "MMMMMMMMMM", // 10 characters
             glyphon::Attrs::new().family(glyphon::Family::Name(&resolved)),
-            glyphon::Shaping::Basic,
+            glyphon::Shaping::Advanced,
         );
         buffer.shape_until_scroll(&mut self.font_system, false);
 
@@ -418,7 +418,7 @@ impl GpuRenderer {
             glyphon::Attrs::new()
                 .family(glyphon::Family::Name(&resolved))
                 .color(Color::rgb(cursor_color[0], cursor_color[1], cursor_color[2])),
-            glyphon::Shaping::Basic,
+            glyphon::Shaping::Advanced,
         );
         buffer.shape_until_scroll(&mut self.font_system, false);
         buffer
@@ -442,10 +442,42 @@ impl GpuRenderer {
         let width = self.config.width as f32;
         let height = self.config.height as f32;
         let tab_bar_top = height - TAB_BAR_HEIGHT;
+        let term_bottom = tab_bar_top as i32;
 
         let mut rect_vertices: Vec<RectVertex> = Vec::with_capacity(512);
 
-        // 1. Bottom Tab Bar full-width background panel
+        // 1. Cell backgrounds and text decorations (underlines, strikethroughs)
+        // Rendered first and strictly clipped to tab_bar_top so terminal cells never occlude the tab bar
+        for q in cell_quads {
+            let qx = config.padding_x + (q.col as f32) * cell_w;
+            let qy = config.padding_y + (q.row as f32) * cell_h;
+            if qy >= tab_bar_top {
+                continue;
+            }
+            let qw = (q.cols_count as f32) * cell_w;
+            let qh = cell_h.min(tab_bar_top - qy);
+            if qh <= 0.0 {
+                continue;
+            }
+
+            if q.color[3] > 0.0 {
+                push_rect(&mut rect_vertices, qx, qy, qw, qh, q.color);
+            }
+            if q.underline {
+                let uy = qy + qh - 2.0;
+                if uy + 1.5 <= tab_bar_top {
+                    push_rect(&mut rect_vertices, qx, uy, qw, 1.5, q.fg_color);
+                }
+            }
+            if q.strikethrough {
+                let sy = qy + (qh * 0.5).round();
+                if sy + 1.5 <= tab_bar_top {
+                    push_rect(&mut rect_vertices, qx, sy, qw, 1.5, q.fg_color);
+                }
+            }
+        }
+
+        // 2. Bottom Tab Bar full-width background panel
         push_rect(
             &mut rect_vertices,
             0.0,
@@ -455,7 +487,7 @@ impl GpuRenderer {
             palette.tab_bar_bg,
         );
 
-        // 2. Top separator line spanning full width
+        // 3. Top separator line spanning full width
         push_rect(
             &mut rect_vertices,
             0.0,
@@ -465,7 +497,7 @@ impl GpuRenderer {
             palette.border,
         );
 
-        // 3. Tab cards
+        // 4. Tab cards
         for tab in tabs {
             if tab.is_active {
                 // Active tab card background
@@ -526,7 +558,7 @@ impl GpuRenderer {
             }
         }
 
-        // 4. Guake-style Tab Bar buttons:
+        // 5. Guake-style Tab Bar buttons:
         // [+] New Tab button anchored to far right
         let btn_w = 26.0;
         let btn_h = 22.0;
@@ -590,28 +622,6 @@ impl GpuRenderer {
         push_rect(&mut rect_vertices, scx - 3.0, scy - 5.0, 3.0, 4.5, set_color);
         push_rect(&mut rect_vertices, scx - 5.0, scy + 2.5, 10.0, 1.5, set_color);
         push_rect(&mut rect_vertices, scx + 0.5, scy + 1.0, 3.0, 4.5, set_color);
-
-        let term_bottom = tab_bar_top as i32;
-
-        // 2. Cell backgrounds and text decorations (underlines, strikethroughs)
-        for q in cell_quads {
-            let qx = config.padding_x + (q.col as f32) * cell_w;
-            let qy = config.padding_y + (q.row as f32) * cell_h;
-            let qw = (q.cols_count as f32) * cell_w;
-            let qh = cell_h;
-
-            if q.color[3] > 0.0 {
-                push_rect(&mut rect_vertices, qx, qy, qw, qh, q.color);
-            }
-            if q.underline {
-                let uy = qy + qh - 2.0;
-                push_rect(&mut rect_vertices, qx, uy, qw, 1.5, q.fg_color);
-            }
-            if q.strikethrough {
-                let sy = qy + (qh * 0.5).round();
-                push_rect(&mut rect_vertices, qx, sy, qw, 1.5, q.fg_color);
-            }
-        }
 
         let text_area = TextArea {
             buffer,
@@ -737,19 +747,19 @@ impl GpuRenderer {
         // Update vertex buffer for 2D UI quads
         if !rect_vertices.is_empty() {
             if rect_vertices.len() > self.rect_vertex_capacity {
-                self.rect_vertex_capacity = rect_vertices.len().next_power_of_two();
-                self.rect_vertex_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                self.rect_vertex_capacity = (rect_vertices.len() * 2).next_power_of_two().max(8192);
+                self.rect_vertex_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("DROP Rect Vertex Buffer Expanded"),
-                    contents: bytemuck::cast_slice(rect_vertices),
+                    size: (self.rect_vertex_capacity * std::mem::size_of::<RectVertex>()) as u64,
                     usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
                 });
-            } else {
-                self.queue.write_buffer(
-                    &self.rect_vertex_buf,
-                    0,
-                    bytemuck::cast_slice(rect_vertices),
-                );
             }
+            self.queue.write_buffer(
+                &self.rect_vertex_buf,
+                0,
+                bytemuck::cast_slice(rect_vertices),
+            );
         }
 
         let mut encoder = self
@@ -818,4 +828,52 @@ pub fn resolve_monospace_font(font_system: &glyphon::FontSystem, preferred: &str
         }
     }
     "Consolas".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calculate_tab_geometries() {
+        let titles = ["pwsh", "cmd", "wsl"];
+        let geoms = calculate_tab_geometries(&titles, 10.0);
+
+        assert_eq!(geoms.len(), 3);
+        assert_eq!(geoms[0].index, 0);
+        assert_eq!(geoms[0].x, 10.0);
+        assert!(geoms[0].width > 0.0);
+        assert!(geoms[0].close_x >= geoms[0].x);
+        assert!(geoms[0].close_x + geoms[0].close_w <= geoms[0].x + geoms[0].width);
+
+        // Next tab starts where previous tab ends
+        assert_eq!(geoms[1].index, 1);
+        assert_eq!(geoms[1].x, geoms[0].x + geoms[0].width);
+
+        assert_eq!(geoms[2].index, 2);
+        assert_eq!(geoms[2].x, geoms[1].x + geoms[1].width);
+    }
+
+    #[test]
+    fn test_push_rect_vertex_generation() {
+        let mut vertices = Vec::new();
+        push_rect(&mut vertices, 50.0, 100.0, 200.0, 40.0, [1.0, 0.5, 0.2, 0.8]);
+
+        // Each rect pushes 6 vertices (2 triangles)
+        assert_eq!(vertices.len(), 6);
+        assert_eq!(vertices[0].position, [50.0, 100.0]);
+        assert_eq!(vertices[0].color, [1.0, 0.5, 0.2, 0.8]);
+        assert_eq!(vertices[1].position, [250.0, 100.0]);
+        assert_eq!(vertices[2].position, [50.0, 140.0]);
+    }
+
+    #[test]
+    fn test_rect_vertex_capacity_math() {
+        let count: usize = 2106;
+        let capacity = (count * 2).next_power_of_two().max(8192);
+        assert!(capacity >= count);
+        let buffer_size = (capacity * std::mem::size_of::<RectVertex>()) as u64;
+        let data_size = (count * std::mem::size_of::<RectVertex>()) as u64;
+        assert!(buffer_size >= data_size);
+    }
 }
