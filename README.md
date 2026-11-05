@@ -12,9 +12,12 @@ Drop slides smoothly from the top of your screen at the touch of a global hotkey
 - **Global Hotkey Integration**: Instant toggle from anywhere via low-level Windows keyboard hook (`Ctrl + '` / `Ctrl + ` `).
 - **Modern Windows Backdrop Effects**: Native Windows 11 Acrylic / Mica system backdrops with automatic fallback to Windows 10 DWM blur-behind.
 - **Hardware-Accelerated Text & Graphics**: Built on **WGPU** (DirectX 12 / Vulkan) and **Glyphon** for crisp, sub-pixel text rasterization locked to V-Sync.
-- **Windows Pseudo Console (ConPTY)**: Powered by `portable-pty` running PowerShell or custom shells with full ANSI escape sequence support via `alacritty_terminal`.
+- **Windows Pseudo Console (ConPTY)**: Powered by `portable-pty` supporting PowerShell 7, Windows PowerShell, CMD, Git Bash, WSL, or custom shells with full ANSI escape sequence support via `alacritty_terminal`.
+- **Text Selection & Clipboard**: Full mouse text selection (click-drag, double-click word, triple-click line), auto-scrolling during drag, and quick copy shortcuts (`Ctrl+C` / `Ctrl+Shift+C`) with visual feedback.
+- **Hyperlink Detection**: Automatic URL recognition (`http://` / `https://`) with `Ctrl + Click` to open links in the default browser.
+- **Drag & Drop Integration**: Drag any file or folder from Windows Explorer directly into the terminal to paste its path.
 - **Tabbed Experience**: Built-in tab bar supporting multiple concurrent shell sessions (`Ctrl+Shift+T`, `Ctrl+Shift+W`, `Ctrl+Tab`, `Alt+1..9`).
-- **Interactive In-Terminal Settings**: Powered by `egui`, allowing real-time customization of fonts, padding, themes, and cursor styles saved to `drop_config.json`.
+- **Interactive In-Terminal Settings**: Powered by `egui`, allowing real-time customization of shells, fonts, padding, themes, and cursor styles saved to `drop_config.json`.
 - **Dynamic Resizing**: Draggable bottom border grip or keyboard shortcuts (`Ctrl+Shift+Up/Down`, `Ctrl+Shift+Enter`) to adjust height on the fly.
 - **Rich Themes**: Ships with curated themes including Dark Slate, Catppuccin, Dracula, Tokyo Night, One Dark, Nord, Cyberpunk, and Solarized Dark.
 
@@ -32,7 +35,9 @@ Drop slides smoothly from the top of your screen at the touch of a global hotkey
 | `Ctrl + Shift + Tab` / `Ctrl + PageUp` | Switch to previous tab |
 | `Alt + 1` .. `Alt + 9` | Direct switch to tab 1 through 9 |
 | `Shift + PageUp` / `Shift + PageDown` | Scroll history buffer |
+| `Ctrl + C` / `Ctrl + Shift + C` | Copy selected text to clipboard |
 | `Ctrl + V` / `Shift + Insert` | Paste from clipboard |
+| `Ctrl + Click` (on URL) | Open link in default web browser |
 | `Ctrl + Shift + Down` | Increase terminal height (+60px) |
 | `Ctrl + Shift + Up` | Decrease terminal height (-60px) |
 | `Ctrl + Shift + Enter` | Toggle between compact (40%) and expanded (85%) height |
